@@ -74,6 +74,7 @@
 
 #include "DisplayHardware/FramebufferSurface.h"
 #include "DisplayHardware/HWComposer.h"
+#include "ExSurfaceFlinger/ExHWComposer.h"
 #include "DisplayHardware/VirtualDisplaySurface.h"
 
 #include "Effects/Daltonizer.h"
@@ -81,6 +82,10 @@
 #include "RenderEngine/RenderEngine.h"
 #include <cutils/compiler.h>
 #include "DisplayUtils.h"
+
+#ifdef USES_HWC_SERVICES
+#include "ExynosHWCService.h"
+#endif
 
 #define DISPLAY_COUNT       1
 
@@ -129,6 +134,10 @@ const String16 sDump("android.permission.DUMP");
 static sp<Layer> lastSurfaceViewLayer;
 
 // ---------------------------------------------------------------------------
+
+#ifdef USES_HWC_SERVICES
+static bool notifyPSRExit = true;
+#endif
 
 SurfaceFlinger::SurfaceFlinger()
     :   BnSurfaceComposer(),
@@ -312,6 +321,14 @@ void SurfaceFlinger::bootFinished()
     // formerly we would just kill the process, but we now ask it to exit so it
     // can choose where to stop the animation.
     property_set("service.bootanim.exit", "1");
+
+#ifdef USES_HWC_SERVICES
+    sp<IServiceManager> sm = defaultServiceManager();
+    sp<android::IExynosHWCService> hwc =
+        interface_cast<android::IExynosHWCService>(sm->getService(String16("Exynos.HWCService")));
+    ALOGD("boot finished. Inform HWC");
+    hwc->setBootFinished();
+#endif
 }
 
 void SurfaceFlinger::deleteTextureAsync(uint32_t texture) {
@@ -798,6 +815,19 @@ void SurfaceFlinger::signalTransaction() {
 }
 
 void SurfaceFlinger::signalLayerUpdate() {
+#ifdef USES_HWC_SERVICES
+    if (notifyPSRExit) {
+        notifyPSRExit = false;
+        sp<IServiceManager> sm = defaultServiceManager();
+        sp<IExynosHWCService> hwcService =
+            interface_cast<android::IExynosHWCService>(
+                sm->getService(String16("Exynos.HWCService")));
+        if (hwcService != NULL)
+            hwcService->notifyPSRExit();
+        else
+            ALOGE("HWCService::notifyPSRExit failed");
+    }
+#endif
     mEventQueue.invalidate();
 }
 
@@ -982,6 +1012,9 @@ void SurfaceFlinger::handleMessageRefresh() {
         doDebugFlashRegions();
         doComposition();
         postComposition();
+#ifdef USES_HWC_SERVICES
+        notifyPSRExit = true;
+#endif
     }
 
     previousExpectedPresent = mPrimaryDispSync.computeNextRefresh(0);
@@ -2003,7 +2036,12 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
         }
 
         // Never touch the framebuffer if we don't have any framebuffer layers
+#if defined(QTI_BSP) && defined(SDM_TARGET)
+        const bool hasHwcComposition = hwc.hasHwcComposition(id) |
+            (reinterpret_cast<ExHWComposer*>(&hwc))->getS3DFlag(id);
+#else
         const bool hasHwcComposition = hwc.hasHwcComposition(id);
+#endif
         if (hasHwcComposition) {
             // when using overlays, we assume a fully transparent framebuffer
             // NOTE: we could reduce how much we need to clear, for instance
@@ -3463,10 +3501,9 @@ void SurfaceFlinger::renderScreenImplLocked(
     // make sure to clear all GL error flags
     engine.checkErrors();
 
-    if (DisplayDevice::DISPLAY_PRIMARY == hw->getDisplayType() &&
-                hw->isPanelInverseMounted()) {
+    if (DisplayDevice::DISPLAY_PRIMARY == hw->getDisplayType()) {
         rotation = (Transform::orientation_flags)
-                (rotation ^ Transform::ROT_180);
+                (rotation ^ hw->getPanelMountFlip());
     }
 
     // set-up our viewport
